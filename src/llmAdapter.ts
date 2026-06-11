@@ -1,4 +1,5 @@
 import Anthropic from '@anthropic-ai/sdk';
+import { GoogleGenerativeAI, type Content, type Part } from '@google/generative-ai';
 import { toolSchemas } from './tools.js';
 
 // ── Shared types ──────────────────────────────────────────────────────────────
@@ -22,7 +23,10 @@ export interface ActionResult {
 // This is the only contract the supervisor loop knows about.
 // Each adapter implements it using its own protocol internally.
 export interface LLMAdapter {
-  getNextAction(obs: PageObservation): Promise<ActionResult>;
+  // toolError: if the previous tool threw, pass the error message here so the
+  // adapter closes the tool_use/tool_result pair correctly and the LLM knows
+  // the action failed.
+  getNextAction(obs: PageObservation, toolError?: string): Promise<ActionResult>;
 }
 
 // ── Anthropic Adapter ─────────────────────────────────────────────────────────
@@ -33,25 +37,30 @@ export interface LLMAdapter {
 class AnthropicAdapter implements LLMAdapter {
   private client = new Anthropic();
   private messages: Anthropic.MessageParam[] = [];
-  private lastToolCallId: string | null = null; // tracked internally — loop never sees this
+  // Anthropic can return multiple tool_use blocks in one response (parallel tool use).
+  // We must close every one of them with a tool_result before the next API call.
+  private pendingToolCallIds: string[] = [];
 
   constructor(private systemPrompt: string) {}
 
-  async getNextAction(obs: PageObservation): Promise<ActionResult> {
+  async getNextAction(obs: PageObservation, toolError?: string): Promise<ActionResult> {
     const observationText =
       `Current URL: ${obs.url}\n` +
       `Page title: ${obs.title}\n\n` +
       `Interactive elements on the page:\n${obs.tree}`;
 
-    // Anthropic protocol: tool_result must immediately follow tool_use.
-    // The adapter handles this internally — the loop just passes observations.
-    if (this.lastToolCallId) {
+    // Close every pending tool_use with a tool_result, then append the observation.
+    if (this.pendingToolCallIds.length > 0) {
+      const resultContent = toolError ?? 'Action executed successfully.';
+      const toolResults = this.pendingToolCallIds.map(id => ({
+        type: 'tool_result' as const,
+        tool_use_id: id,
+        content: resultContent,
+        is_error: !!toolError,
+      }));
       this.messages.push({
         role: 'user',
-        content: [
-          { type: 'tool_result', tool_use_id: this.lastToolCallId, content: 'Action executed successfully.' },
-          { type: 'text', text: observationText },
-        ],
+        content: [...toolResults, { type: 'text', text: observationText }],
       });
     } else {
       this.messages.push({ role: 'user', content: observationText });
@@ -68,19 +77,23 @@ class AnthropicAdapter implements LLMAdapter {
     this.messages.push({ role: 'assistant', content: response.content });
 
     let reasoning = '';
-    let toolBlock: Anthropic.ToolUseBlock | null = null;
+    const toolBlocks: Anthropic.ToolUseBlock[] = [];
 
     for (const block of response.content) {
-      if (block.type === 'text')     reasoning  = block.text;
-      if (block.type === 'tool_use') toolBlock  = block;
+      if (block.type === 'text')     reasoning = block.text;
+      if (block.type === 'tool_use') toolBlocks.push(block);
     }
 
-    // Store the ID so we can close the pair on the next call.
-    this.lastToolCallId = toolBlock?.id ?? null;
+    // Track ALL returned tool_use IDs — every one must be closed next call.
+    // If the model returned multiple (parallel tool use), we execute only the
+    // first and close the rest with the same result. The model will see the
+    // current page state next step and can adjust.
+    this.pendingToolCallIds = toolBlocks.map(b => b.id);
 
+    const first = toolBlocks[0] ?? null;
     return {
-      toolName:  toolBlock?.name  ?? '',
-      toolInput: (toolBlock?.input ?? {}) as Record<string, unknown>,
+      toolName:  first?.name  ?? '',
+      toolInput: (first?.input ?? {}) as Record<string, unknown>,
       reasoning,
     };
   }
@@ -126,7 +139,7 @@ class OllamaAdapter implements LLMAdapter {
     this.messages.push({ role: 'system', content: systemPrompt });
   }
 
-  async getNextAction(obs: PageObservation): Promise<ActionResult> {
+  async getNextAction(obs: PageObservation, toolError?: string): Promise<ActionResult> {
     const observationText =
       `Current URL: ${obs.url}\n` +
       `Page title: ${obs.title}\n\n` +
@@ -134,7 +147,7 @@ class OllamaAdapter implements LLMAdapter {
 
     // Ollama tool result: a separate 'tool' role message (no ID required).
     if (this.hadPreviousToolCall) {
-      this.messages.push({ role: 'tool', content: 'Action executed successfully.' });
+      this.messages.push({ role: 'tool', content: toolError ?? 'Action executed successfully.' });
     }
     this.messages.push({ role: 'user', content: observationText });
 
@@ -182,13 +195,106 @@ class OllamaAdapter implements LLMAdapter {
   }
 }
 
+// ── Gemini Adapter ────────────────────────────────────────────────────────────
+// Owns the Gemini-specific details:
+//   • message history in Gemini's Content[] format (role: 'user' | 'model')
+//   • tool calls returned as functionCall parts; results sent back as functionResponse parts
+//   • no IDs — Gemini matches function responses by name, not ID
+//   • function response + next observation are combined into one user message
+//     to preserve the required user/model alternation
+
+// Translate Anthropic tool schemas → Gemini FunctionDeclaration format.
+// Gemini accepts standard JSON Schema for parameters, so input_schema passes through directly.
+function toGeminiTools(schemas: Anthropic.Tool[]) {
+  return [{
+    functionDeclarations: schemas.map(s => ({
+      name: s.name,
+      description: s.description ?? '',
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      parameters: s.input_schema as any,
+    })),
+  }];
+}
+
+class GeminiAdapter implements LLMAdapter {
+  private history: Content[] = [];
+  private pendingFunctionName: string | null = null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private model: any;
+
+  constructor(systemPrompt: string) {
+    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY ?? '');
+    this.model = genAI.getGenerativeModel({
+      model: process.env.GEMINI_MODEL ?? 'gemini-1.5-flash',
+      systemInstruction: systemPrompt,
+      tools: toGeminiTools(toolSchemas),
+      // Force Gemini to always respond with a function call.
+      // Without this, Gemini may return plain text instead of calling a tool.
+      toolConfig: { functionCallingConfig: { mode: 'ANY' as any } },
+    });
+  }
+
+  async getNextAction(obs: PageObservation, toolError?: string): Promise<ActionResult> {
+    const observationText =
+      `Current URL: ${obs.url}\n` +
+      `Page title: ${obs.title}\n\n` +
+      `Interactive elements on the page:\n${obs.tree}`;
+
+    // Build user message parts.
+    // If there is a pending function call, close it with a functionResponse first,
+    // then append the new observation — all in one user message to keep the
+    // required user/model turn alternation intact.
+    const parts: Part[] = [];
+    if (this.pendingFunctionName) {
+      parts.push({
+        functionResponse: {
+          name: this.pendingFunctionName,
+          response: { result: toolError ?? 'Action executed successfully.' },
+        },
+      });
+    }
+    parts.push({ text: observationText });
+
+    const userMessage: Content = { role: 'user', parts };
+    const contents = [...this.history, userMessage];
+
+    const result = await this.model.generateContent({ contents });
+    const modelContent: Content = result.response.candidates?.[0]?.content
+      ?? { role: 'model', parts: [{ text: '' }] };
+
+    this.history.push(userMessage, modelContent);
+
+    let reasoning = '';
+    let fnCall: { name: string; args: Record<string, unknown> } | null = null;
+
+    for (const part of modelContent.parts) {
+      if ('text' in part && part.text)                reasoning = part.text;
+      if ('functionCall' in part && part.functionCall) {
+        fnCall = {
+          name: part.functionCall.name,
+          args: (part.functionCall.args ?? {}) as Record<string, unknown>,
+        };
+      }
+    }
+
+    this.pendingFunctionName = fnCall?.name ?? null;
+
+    return {
+      toolName:  fnCall?.name  ?? '',
+      toolInput: fnCall?.args  ?? {},
+      reasoning,
+    };
+  }
+}
+
 // ── Factory ───────────────────────────────────────────────────────────────────
 // The only thing the supervisor loop imports. Pass a provider string, get back
 // an adapter. Adding a new provider = adding one new class + one line here.
-export type Provider = 'anthropic' | 'ollama';
+export type Provider = 'anthropic' | 'ollama' | 'gemini';
 
 export function createAdapter(provider: Provider, systemPrompt: string): LLMAdapter {
   if (provider === 'anthropic') return new AnthropicAdapter(systemPrompt);
   if (provider === 'ollama')    return new OllamaAdapter(systemPrompt);
+  if (provider === 'gemini')    return new GeminiAdapter(systemPrompt);
   throw new Error(`Unknown LLM provider: "${provider}"`);
 }

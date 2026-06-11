@@ -13,31 +13,33 @@ OutPost breaks it into `Task` units, runs each one through the generic harness r
 
 ---
 
-## Current State: Level 1 — Single-Task Harness (HN Upvote)
+## Current State
 
-The harness is fully working for one task. The refactor to multi-task/multi-platform is in progress.
+The refactor to multi-file architecture is complete and working. The harness has been tested on Hacker News (upvote) and LinkedIn (profile read, messaging). Three LLM providers are supported.
 
 ---
 
-## Target Architecture (in progress)
+## File Structure
 
 ```
 src/
-  index.ts        ← Entry point: assembles task(s) and runs them
-  runner.ts       ← Generic supervisor loop — zero platform knowledge
+  index.ts        ← Entry point: assembles task + provider, runs it. System prompt lives here.
+  runner.ts       ← Generic supervisor loop — zero platform knowledge. Never changes.
   task.ts         ← Task interface: the contract every platform must implement
   domExtractor.ts ← Injects JS into browser, returns text tree of interactive elements
   tools.ts        ← Tool Registry: navigate / click / type / done
-  llmAdapter.ts   ← Provider abstraction: AnthropicAdapter + OllamaAdapter
-  loginHandler.ts ← LoginHandler interface + per-platform implementations
+  llmAdapter.ts   ← Provider abstraction: AnthropicAdapter + GeminiAdapter + OllamaAdapter
+  loginHandler.ts ← CookieLoginHandler: generic session-cookie auth, works for any site
 
 tasks/
-  hn_upvote.ts        ← HN: systemPrompt, isAuthWall, onAuthResolved, verify
+  hn_upvote.ts        ← HN: isAuthWall, onAuthResolved, verify
   reddit_post.ts      ← (future)
   linkedin_post.ts    ← (future)
 ```
 
-### The Task Interface — core contract
+---
+
+## The Task Interface — core contract
 
 ```typescript
 interface Task {
@@ -54,7 +56,9 @@ interface Task {
 
 Adding a new platform = one new file in `tasks/` implementing `Task`. The runner never changes.
 
-### Campaign Vision (future)
+---
+
+## Campaign Vision (future)
 
 ```typescript
 // A campaign is an ordered list of tasks
@@ -66,25 +70,13 @@ const campaign: Task[] = [
 
 ---
 
-## Current File Structure (pre-refactor)
-
-```
-src/
-  agent.ts        ← Supervisor Loop + all HN-specific logic (being split out)
-  domExtractor.ts ← unchanged
-  tools.ts        ← unchanged
-  llmAdapter.ts   ← unchanged
-  loginHandler.ts ← LoginHandler interface + HackerNewsLoginHandler
-```
-
----
-
 ## Stack
 
 - **TypeScript 5.x** with strict mode
 - **Playwright 1.49+** for browser automation
 - **ts-node** (ESM mode) — no build step, `npm start` runs directly
 - **@anthropic-ai/sdk** — Anthropic provider
+- **@google/generative-ai** — Gemini provider
 - **dotenv** — env var loading
 
 ---
@@ -102,14 +94,19 @@ npm start
 ## Configuration (.env)
 
 ```
+LLM_PROVIDER=gemini               # anthropic | ollama | gemini
+
 ANTHROPIC_API_KEY=...
 ANTHROPIC_MODEL=claude-haiku-4-5-20251001
+
+GEMINI_API_KEY=...
+GEMINI_MODEL=gemini-1.5-flash
+
 OLLAMA_API_KEY=...
 OLLAMA_MODEL=ministral-3:3b
-LLM_PROVIDER=anthropic        # or: ollama
-HN_USERNAME=...               # used by loginHandler only — never passed to LLM
-HN_PASSWORD=...
 ```
+
+No credentials for HN or LinkedIn — the harness uses `cookies/<hostname>.json` saved from manual login.
 
 ---
 
@@ -117,7 +114,10 @@ HN_PASSWORD=...
 
 - **Task = unit of work** — one platform, one goal, one system prompt. Swapping the task changes the campaign. The runner never changes.
 - **Verification is code, not LLM** — after `done()`, the harness checks observable DOM state (CSS classes, element presence). No second LLM call. Deterministic, free, instantaneous.
-- **Harness Interception Gate** — auth walls are handled silently between LLM calls. The harness logs in via Playwright, replays the blocked action using the authenticated DOM link, and resumes. Credentials never appear in the LLM's message history.
+- **Cookie-based auth** — `CookieLoginHandler` is parameterless and platform-agnostic. Derives the hostname from the live page URL, saves/loads `cookies/<hostname>.json`. First run = manual login; every run after = silent injection.
+- **Auth wall redirect extraction** — harness extracts the intended destination from the auth wall URL (`sessionRedirect`, `next`, `redirect_uri`) and navigates directly there, skipping the redirect chain.
+- **SPA-safe load strategy** — `waitForLoadState('load')` then `networkidle(5s, catch)`. Works for both traditional sites and heavy SPAs like LinkedIn.
+- **DOM-aware stuck loop** — checks URL + DOM fingerprint. Fires only when both are unchanged for 4 consecutive steps. URL-only checks fire too early on SPAs.
 - **Adapter pattern for providers** — `LLMAdapter` interface hides all protocol differences. Swap `LLM_PROVIDER` to change models. The runner never changes.
 - **Harness guards run before LLM** — auth wall, stuck loop, and error page checks run every step before the LLM is consulted. The harness can stop the loop independently.
 - **`page.evaluate()` bridge** — DOM extraction runs inside the browser's V8 engine. Only JSON-serialisable values cross back to Node.js.

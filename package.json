@@ -4,10 +4,11 @@
   "description": "Level 0 — BrowserContext agent using Playwright and TypeScript",
   "type": "module",
   "scripts": {
-    "start": "node --loader ts-node/esm src/agent.ts"
+    "start": "node --loader ts-node/esm src/index.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.104.1",
+    "@google/generative-ai": "^0.21.0",
     "dotenv": "^17.4.2",
     "playwright": "^1.49.0"
   },

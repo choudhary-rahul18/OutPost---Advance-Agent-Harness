@@ -1,6 +1,6 @@
-# BaseHarness
+# BaseHarness / OutPost
 
-A progressively hardened agentic browser automation harness. Each level adds a new layer of reliability — not by improving the prompt, but through deterministic software engineering in the harness itself.
+A progressively hardened agentic browser automation harness. Each session adds a new layer of reliability — not by improving the prompt, but through deterministic software engineering in the harness itself.
 
 The core principle: **the LLM decides actions; the harness verifies outcomes in code.**
 
@@ -10,7 +10,7 @@ The core principle: **the LLM decides actions; the harness verifies outcomes in 
 
 The harness launches a browser, gives an LLM a live view of the DOM at each step, executes whatever tool the LLM calls, and independently verifies the result. The LLM can hallucinate — the harness cannot be fooled by a hallucination.
 
-Current task: upvote the top story on Hacker News.
+Swap the system prompt in `src/index.ts` to change the task. The runner never changes.
 
 ---
 
@@ -20,6 +20,7 @@ Current task: upvote the top story on Hacker News.
 - **Playwright 1.49+** — browser automation
 - **ts-node** (ESM) — runs TypeScript directly, no build step
 - **@anthropic-ai/sdk** — Anthropic provider
+- **@google/generative-ai** — Gemini provider
 - **dotenv** — env var loading
 
 ---
@@ -34,13 +35,16 @@ npx playwright install chromium   # first time only
 Create a `.env` file:
 
 ```
+LLM_PROVIDER=gemini               # anthropic | ollama | gemini
+
 ANTHROPIC_API_KEY=...
-OLLAMA_API_KEY=...
-LLM_PROVIDER=anthropic        # or: ollama
 ANTHROPIC_MODEL=claude-haiku-4-5-20251001
+
+GEMINI_API_KEY=...
+GEMINI_MODEL=gemini-1.5-flash
+
+OLLAMA_API_KEY=...
 OLLAMA_MODEL=ministral-3:3b
-HN_USERNAME=your_hn_username
-HN_PASSWORD=your_hn_password
 ```
 
 ```bash
@@ -53,20 +57,20 @@ npm start
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  Supervisor Loop (agent.ts)                             │
+│  Supervisor Loop (runner.ts)                            │
 │  while step < MAX_STEPS:                                │
 │    1. Harness Checks (runs before LLM):                 │
-│       • Auth wall? → Interception Gate (login + replay) │
-│       • Stuck loop? → stop                              │
+│       • Auth wall? → CookieLoginHandler (silent login)  │
+│       • Stuck loop? → stop (URL + DOM fingerprint)      │
 │       • Error page? → stop                              │
 │    2. adapter.getNextAction() → tool call               │
 │    3. Tool Registry → Playwright action                 │
-│  after done(): verifyOutcome() → DOM-state check        │
+│  after done(): task.verify() → DOM-state check          │
 └──────────────────────┬──────────────────────────────────┘
                        │
-              ┌────────┴────────┐
-              ▼                 ▼
-       AnthropicAdapter    OllamaAdapter
+          ┌────────────┼────────────┐
+          ▼            ▼            ▼
+  AnthropicAdapter  GeminiAdapter  OllamaAdapter
 ```
 
 ---
@@ -75,26 +79,17 @@ npm start
 
 ```
 src/
-  agent.ts          — Supervisor Loop, harness guards, verifier
-  domExtractor.ts   — Injects JS into browser, returns text tree of interactive elements
-  tools.ts          — Tool Registry: navigate / click / type / done
-  llmAdapter.ts     — Provider abstraction: AnthropicAdapter + OllamaAdapter
-  loginHandler.ts   — Harness Interception Gate: handles auth silently, invisible to LLM
+  index.ts        — Entry point: assembles task and provider, runs it
+  runner.ts       — Generic supervisor loop — zero platform knowledge
+  task.ts         — Task interface: contract every platform must implement
+  domExtractor.ts — Injects JS into browser, returns text tree of interactive elements
+  tools.ts        — Tool Registry: navigate / click / type / done
+  llmAdapter.ts   — Provider abstraction: Anthropic + Gemini + Ollama
+  loginHandler.ts — CookieLoginHandler: generic session-cookie auth for any site
+
+tasks/
+  hn_upvote.ts    — HN-specific: isAuthWall, onAuthResolved, verify
 ```
-
----
-
-## Levels
-
-### Level 0 — BrowserContext Agent
-Basic Playwright agent: `browser → context → page`. Hard-coded selectors.
-
-### Level 1 — Naked Agent + Deterministic Verifiers
-- All hard-coded selectors removed. LLM drives actions via a live DOM tree.
-- `verifyOutcome()` — checks final page state in code after `done()`. PASSED/FAILED verdict.
-- Mid-loop guards — `isAuthWall`, `isStuckLoop`, `isErrorPage` run before every LLM call.
-- LLM Adapter Layer — swap between Anthropic and Ollama via `LLM_PROVIDER` env var.
-- **Harness Interception Gate** — when auth wall detected, harness logs in silently, replays the original action via authenticated DOM link, resumes loop. Credentials never touch the LLM.
 
 ---
 
@@ -102,18 +97,24 @@ Basic Playwright agent: `browser → context → page`. Hard-coded selectors.
 
 **Verification is code, not LLM.** After `done()`, the harness checks observable DOM state (CSS classes, element presence) with Playwright. No second LLM call. Deterministic, free, instantaneous.
 
-**Harness Interception Gate for auth.** No login tool is exposed to the LLM. When an auth wall is hit, the harness pauses the loop, logs in via Playwright, replays the blocked action using the authenticated DOM link (which carries a session `auth=` token), and resumes. The LLM's message history skips the entire auth episode.
+**Cookie-based login — platform agnostic.** No credentials in code or `.env`. First run pauses for manual login; cookies are saved to `cookies/<hostname>.json`. Every subsequent run injects them silently. Works for 2FA, CAPTCHAs, anything.
 
-**Adapter pattern for providers.** `LLMAdapter` interface hides all protocol differences. Swap `LLM_PROVIDER=ollama` to switch models. The supervisor loop never changes.
+**Auth wall redirect extraction.** When an auth wall is hit, the harness extracts the intended destination from the auth wall URL's query params (`sessionRedirect`, `next`, `redirect_uri`) and navigates directly there — skipping the redirect chain that would otherwise time out.
 
-**DOM tree as the LLM's eyes.** `domExtractor.ts` injects JS into the browser via `page.evaluate()`, stamps each interactive element with `data-index`, and returns a plain text tree. The LLM references elements by index; the Tool Registry finds them by `[data-index="N"]`.
+**DOM-aware stuck loop.** The stuck loop checks both URL and a DOM fingerprint. On SPAs like LinkedIn, meaningful actions change page content without changing the URL. A URL-only check would fire too early.
+
+**SPA-safe load strategy.** All tools use `waitForLoadState('load')` then attempt `networkidle` with a 5-second cap. Normal sites settle in <1s; SPAs get 5s to render before the harness moves on. No more 30-second timeouts.
+
+**Adapter pattern for providers.** `LLMAdapter` interface hides all protocol differences. Set `LLM_PROVIDER` in `.env` to switch. The runner never changes.
 
 **Harness guards run before LLM.** Every step, the harness checks page state before consulting the LLM. The harness can stop or redirect the loop independently of the LLM's reasoning.
+
+**DOM tree as the LLM's eyes.** `domExtractor.ts` injects JS via `page.evaluate()`, stamps each interactive element with `data-index`, and returns a plain text tree. The LLM references elements by index; the Tool Registry finds them by `[data-index="N"]`.
 
 ---
 
 ## Security Properties
 
-- Credentials (`HN_USERNAME`, `HN_PASSWORD`) exist only in `process.env` — never in the LLM's message array
-- No login tool in `toolSchemas` — prompt injection cannot extract credentials via a tool call argument
+- No credentials anywhere in code — `CookieLoginHandler` uses saved browser cookies only
+- No login tool in `toolSchemas` — prompt injection cannot extract credentials via a tool call
 - Auth wall URL is never sent to the LLM as an observation — harness intercepts between steps

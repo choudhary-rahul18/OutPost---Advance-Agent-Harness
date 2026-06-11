@@ -22,7 +22,8 @@ export const toolRegistry: Record<string, (page: Page, args: ToolInput) => Promi
     const { url } = args as NavigateInput;
     console.log(`  → TOOL: navigate("${url}")`);
     await page.goto(url);
-    await page.waitForLoadState('networkidle');
+    await page.waitForLoadState('load');
+    try { await page.waitForLoadState('networkidle', { timeout: 5000 }); } catch { /* SPA — content rendered despite background requests */ }
   },
 
   click: async (page, args) => {
@@ -31,7 +32,8 @@ export const toolRegistry: Record<string, (page: Page, args: ToolInput) => Promi
     // This is why we stamped data-index in the DOM Extractor:
     // [data-index="N"] is a CSS attribute selector — find the element we labelled.
     await page.locator(`[data-index="${elementIndex}"]`).click();
-    await page.waitForLoadState('networkidle');
+    await page.waitForLoadState('load');
+    try { await page.waitForLoadState('networkidle', { timeout: 5000 }); } catch { /* SPA */ }
   },
 
   type: async (page, args) => {
@@ -40,7 +42,8 @@ export const toolRegistry: Record<string, (page: Page, args: ToolInput) => Promi
     const locator = page.locator(`[data-index="${elementIndex}"]`);
     await locator.fill(text);
     await locator.press('Enter');
-    await page.waitForLoadState('networkidle');
+    await page.waitForLoadState('load');
+    try { await page.waitForLoadState('networkidle', { timeout: 5000 }); } catch { /* SPA */ }
   },
 
 };

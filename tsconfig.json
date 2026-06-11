@@ -4,9 +4,7 @@
     "module": "ESNext",
     "moduleResolution": "bundler",
     "esModuleInterop": true,
-    "strict": true,
-    "outDir": "./dist",
-    "rootDir": "./src"
+    "strict": true
   },
-  "include": ["src/**/*"]
+  "include": ["src/**/*", "tasks/**/*"]
 }

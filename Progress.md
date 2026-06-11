@@ -360,3 +360,344 @@ Ministral 3B (a 3B-parameter model) completed the task correctly today. The same
 | Auth wall — `auth=` token missing | Fixed — Harness reads authenticated link from live DOM | Upvote replayed correctly |
 | Stuck loop | Fixed — `isStuckLoop()` runs every step | Stops after 3 identical URLs |
 | Hallucinated success | Harness overrules LLM claim | DOM-state verifier is ground truth |
+
+---
+
+## Session 5 — 2026-06-11
+
+### What We Built
+Four things on top of the Session 4 harness:
+
+1. **Multi-file refactor** — split the monolithic `agent.ts` into the target architecture from `CLAUDE.md`. The runner is now generic; all HN-specific logic lives in one task file.
+2. **`onAuthResolved` simplification** — removed the harness-driven vote replay. The LLM now re-clicks the upvote after login. Harness only handles credentials; LLM handles actions.
+3. **Cookie-based login** — replaced `HackerNewsLoginHandler` (which stored credentials in `.env`) with `CookieLoginHandler` (works for any platform). First run: pauses for manual login, saves session cookies to disk. Every run after: injects cookies silently — no credentials anywhere in code.
+4. **Two runtime bug fixes** — tool executor crash and Anthropic 400 (parallel tool use).
+
+---
+
+### Files Created / Changed
+| File | Purpose |
+|---|---|
+| `src/task.ts` | NEW: `Task` interface — the contract every platform must implement |
+| `src/runner.ts` | NEW: Generic supervisor loop — zero platform knowledge |
+| `src/index.ts` | NEW: Entry point — assembles task + provider, runs it. System prompt lives here. |
+| `tasks/hn_upvote.ts` | NEW: `HNUpvoteTask` — `systemPrompt`, `isAuthWall`, `onAuthResolved`, `verify` |
+| `src/loginHandler.ts` | Replaced `HackerNewsLoginHandler` with `CookieLoginHandler` |
+| `src/llmAdapter.ts` | Fixed parallel tool use bug (`pendingToolCallIds[]` instead of `lastToolCallId`) |
+| `src/runner.ts` | Added try-catch around tool executor; forwards tool errors to adapter |
+| `src/agent.ts` | DELETED — fully replaced by new architecture |
+
+---
+
+### Architecture: Final Refactored Layout
+```
+src/
+  index.ts        ← entry point + system prompt (user-facing config)
+  runner.ts       ← generic supervisor loop — never changes
+  task.ts         ← Task interface
+  domExtractor.ts ← unchanged
+  tools.ts        ← unchanged
+  llmAdapter.ts   ← unchanged (bug fixed)
+  loginHandler.ts ← CookieLoginHandler (platform-agnostic)
+
+tasks/
+  hn_upvote.ts    ← HN-specific: isAuthWall, onAuthResolved, verify
+```
+
+---
+
+### Key Design Principles Established
+
+#### System prompt vs. Task class
+- **System prompt** → what the LLM tries to do. Lives in `index.ts`. Change it to change the agent's goal on the same platform.
+- **Task class** → what the harness does deterministically. New file only when `isAuthWall`, `onAuthResolved`, or `verify` logic changes (i.e., new platform or fundamentally different verification).
+
+#### Harness owns credentials; LLM owns actions
+- `onAuthResolved` was originally replaying the upvote in Playwright code after login. Removed: the LLM re-clicks the upvote on the next step. The harness only handles the auth layer — extracting the story ID for later verification.
+- Rule: **harness does what requires determinism or security. LLM does everything else.**
+
+#### Cookie-based login = platform-agnostic auth
+- No credentials in code or `.env`. First run pauses for human to log in manually — handles 2FA, CAPTCHAs, anything.
+- Cookies saved to `cookies/<platform>.json` (gitignored). Injected into `BrowserContext` on subsequent runs.
+- Adding LinkedIn: `new CookieLoginHandler('cookies/linkedin.json')`. Nothing else changes.
+
+---
+
+### Concepts Learned
+
+#### Anthropic Parallel Tool Use
+- Anthropic models can return **multiple `tool_use` blocks** in a single response when the prompt implies simultaneous actions (e.g., "upvote AND read").
+- The API requires a `tool_result` for **every** `tool_use` ID before the next message. Closing only the last one leaves earlier IDs dangling → `400 BadRequestError`.
+- Fix: track `pendingToolCallIds: string[]` (all IDs from the response). On next call, emit one `tool_result` block per ID. Execute only the first tool call; model adapts from observed page state.
+
+#### Tool failure must be communicated to the LLM
+- Original: tool throws → runner catches → loop continues → adapter sends `"Action executed successfully."` as the tool_result.
+- Problem: LLM reasons about a wrong state (believes the action worked).
+- Fix: runner stores the error message in `pendingToolError`. Adapter uses it as the `tool_result` content with `is_error: true`. LLM sees what actually failed and can adapt.
+
+#### Cookies are harness-layer, not LLM-layer
+- `page.context().addCookies()` injects the session into the Playwright `BrowserContext` before any page load.
+- The LLM is never called during login. It just sees a logged-in page on the next step.
+- The cookies file is read and applied entirely in harness code.
+
+---
+
+### Bugs Hit & Fixed (Session 5)
+
+| Bug | Cause | Fix |
+|---|---|---|
+| `TimeoutError` crashes process | Playwright timeout in tool executor propagated uncaught | try-catch in runner; `pendingToolError` forwarded to adapter |
+| `400 BadRequestError` on step 2 | Anthropic returned 2 `tool_use` blocks; adapter only closed 1 | `pendingToolCallIds[]` tracks all IDs; all closed before next API call |
+
+---
+
+### Test Run — Session 5
+
+#### Test 6 — "Upvote 2nd post and summarize it", Anthropic, with cookie login
+- Step 1: `click(17)` — upvote arrow for 2nd story (πFS)
+- Step 2: Auth wall. **CookieLoginHandler** found `cookies/hn.json` → injected cookies → session restored. LLM not called.
+- Step 3: LLM sees logged-in HN → `click(20)` — clicked πFS story link
+- Step 4: On GitHub repo page → `click(53)` — opened README.md
+- Step 5: LLM read README, called `done()` with full summary
+- Verifier: `PASSED — Upvote confirmed: vote link is nosee for story 48480978`
+- **Result:** Multi-step task (upvote + navigate + read + summarize) completed end-to-end. ✅
+
+---
+
+### Failure Modes — Updated
+
+| # | Failure Mode | Harness Response |
+|---|---|---|
+| Blind `done()` acceptance | Fixed — `task.verify()` runs on every `done()` | PASSED/FAILED verdict |
+| Auth wall | Fixed — CookieLoginHandler injects session silently | Credentials never touch LLM |
+| Tool executor crash | Fixed — try-catch in runner | Loop continues; LLM adapts |
+| Parallel tool use (Anthropic) | Fixed — `pendingToolCallIds[]` | All tool_use IDs closed before next API call |
+| Tool failure hidden from LLM | Fixed — `pendingToolError` forwarded | LLM receives actual error as `tool_result` |
+| Stuck loop | Fixed — `isStuckLoop()` | Stops after 3 identical URLs |
+
+---
+
+## Session 6 — 2026-06-11
+
+### What We Built
+Tested the harness on a second platform (LinkedIn) and iterated the `CookieLoginHandler` to be fully generic — zero configuration, works for any site automatically.
+
+---
+
+### Issues Found & Fixed
+
+#### Issue 1 — Wrong cookies tried on LinkedIn
+When the LinkedIn auth wall was hit, `CookieLoginHandler` tried HN cookies (its only cookie file). The HN cookies were injected, the harness navigated back to `task.startUrl` (HN), saw no `/login` in the URL, and falsely reported "Session restored." The LLM then found itself back on HN confused.
+
+**Root cause:** `canHandle()` returned `true` for all URLs. The handler had no way to know the auth wall was for a different site.
+
+**Fix 1 (intermediate):** Added a `domain` constructor parameter. `canHandle(url)` checked `url.includes(domain)`. This correctly rejected LinkedIn auth walls when the handler was configured for `ycombinator.com`.
+
+**Fix 2 (final):** Removed the `domain` parameter entirely. The handler now derives the hostname from the live page URL at login time (`new URL(page.url()).hostname`) and auto-names the cookie file: `cookies/<hostname>.json`. Zero configuration. Works for any site.
+
+#### Issue 2 — User had to explicitly mention the platform in loginHandler config
+With Fix 1, `index.ts` required `task.loginHandler = new CookieLoginHandler('cookies/linkedin.json', 'linkedin.com')` — redundant when the LinkedIn URL was already in the system prompt. Fix 2 eliminated this entirely.
+
+---
+
+### Files Changed
+| File | Change |
+|---|---|
+| `src/loginHandler.ts` | `CookieLoginHandler` is now parameterless. Derives hostname from `page.url()` at login time. Cookie file auto-named `cookies/<hostname>.json`. |
+| `tasks/hn_upvote.ts` | `new CookieLoginHandler()` — no args |
+| `src/index.ts` | No platform-specific login config needed |
+
+---
+
+### Key Design Principle Established
+
+#### Auto-derived domain = truly generic login
+The handler doesn't need to know the platform in advance. When an auth wall is hit:
+1. `canHandle()` returns `true` (willing to try any site)
+2. `login()` reads `new URL(page.url()).hostname` → derives `www.linkedin.com`
+3. Looks for `cookies/www.linkedin.com.json`
+4. If missing → pause for manual login → save to that file
+5. Next run → inject silently
+
+Adding a new platform requires **zero code changes**. First run pauses; every run after is silent.
+
+---
+
+### Concepts Learned
+
+#### `waitForLoadState('networkidle')` vs heavy SPAs
+LinkedIn (and many modern sites) never reach `networkidle` — they continuously fire background requests. Playwright's 30s timeout fires even though the page has fully rendered. The harness catches the timeout, the LLM observes the current URL (which IS the correct page), and continues. The page content is accessible even after a `networkidle` timeout.
+
+#### `task.startUrl` as the `returnUrl` after login
+After login, the harness returns to `task.startUrl` (HN in this case). The LLM then sees it's on HN, not LinkedIn, and re-navigates. This costs one extra step but works correctly — the LLM adapts.
+
+---
+
+### Test Run — Session 6
+
+#### Test 7 — Read LinkedIn profile, Anthropic, cookie login
+- Step 1: LLM on HN → `navigate("https://www.linkedin.com/in/rahul18-iitb")`
+- Step 2: LinkedIn auth wall → `CookieLoginHandler` found `cookies/www.linkedin.com.json` → session restored → returned to HN
+- Step 3: LLM sees HN again → `navigate("https://www.linkedin.com/in/rahul18-iitb")` again → `waitForLoadState` timed out (LinkedIn SPA) but page loaded
+- Step 4: LLM on `https://www.linkedin.com/in/rahul18-iitb/` → read full DOM → called `done()` with complete profile summary (experience, education, certifications, skills, engagement metrics)
+- Verifier: `PASSED — No known failure patterns detected.`
+- **Result:** Full LinkedIn profile read end-to-end. LLM adapted around the `networkidle` timeout. ✅
+
+---
+
+### Failure Modes — Updated
+
+| # | Failure Mode | Harness Response |
+|---|---|---|
+| Wrong cookies for platform | Fixed — hostname auto-derived from auth wall URL | Each platform gets its own `cookies/<hostname>.json` |
+| `networkidle` timeout on SPA | Handled — try-catch in runner | LLM observes loaded page and continues |
+
+---
+
+## Session 7 — 2026-06-11
+
+### What We Built
+Two fixes to close the loop on verify FAILED and auth wall recovery:
+
+1. **Retry on verify FAILED** — when `task.verify()` returns FAILED after `done()`, the runner feeds the failure reason back to the LLM via `pendingToolError` and continues the loop. The LLM gets another attempt rather than the run ending silently.
+2. **Auth wall interception signal** — when the harness handles an auth wall (login + return), it sets `pendingToolError` to tell the LLM explicitly that its previous action was intercepted and not completed. The LLM retries the action on the authenticated page.
+
+---
+
+### Files Changed
+| File | Change |
+|---|---|
+| `src/runner.ts` | On `done()` + FAILED: set `pendingToolError`, `continue` instead of `break` |
+| `src/runner.ts` | On auth wall handled: set `pendingToolError = "action not completed, please retry"` |
+
+---
+
+### Root Cause of the Failure
+
+Before these fixes, when the LLM upvoted a story and got redirected to the auth wall:
+1. Harness logged in silently, returned to HN front page
+2. LLM saw: "I clicked the upvote. Now I'm logged in on HN." → concluded the vote worked
+3. LLM called `done()` without re-clicking the upvote
+4. `verify()`: active upvote link still present → `FAILED`
+5. Runner printed FAILED and exited
+
+The LLM had no signal that its click was intercepted and never executed. From its message history, the click "succeeded" (tool_result was "Action executed successfully."). It had no reason to retry.
+
+---
+
+### Concepts Learned
+
+#### The LLM's message history is the only source of truth for the LLM
+The harness can observe page state directly. The LLM can only reason about what its `tool_result` messages tell it. If the harness silently handles an auth wall and the LLM receives "Action executed successfully", it will reason as if the action happened — even if it didn't.
+
+**Rule:** any time the harness intercepts and changes what the LLM's action actually did, it must communicate that via `pendingToolError`. Silence = the LLM assumes success.
+
+#### `pendingToolError` as the harness-to-LLM communication channel
+`pendingToolError` is now used for three cases:
+1. **Playwright exception** (tool executor throws) → LLM gets the error message
+2. **Verify FAILED** → LLM gets the failure reason and retries
+3. **Auth wall handled** → LLM learns its action was intercepted and not completed
+
+All three feed into the same adapter mechanism: `tool_result` with `is_error: true` and the error string as content.
+
+---
+
+### Test Run — Session 7
+
+#### Test 8 — HN Upvote, retry on verify FAILED (before auth wall signal fix)
+- Step 1: `click(10)` — upvote arrow → auth wall redirect
+- Step 2: Login with saved cookies → returned to HN
+- Step 3: LLM assumed vote worked → `done()` → verify `FAILED — Active upvote link still present`
+- Step 4: LLM retried — clicked wrong element (13, not the upvote) → URL unchanged
+- Step 5: URL unchanged 3× → stuck loop fired
+- **Observation:** Retry loop worked, but LLM didn't know WHAT to retry — it guessed wrong
+
+#### After auth wall signal fix
+- Step 3: LLM receives `tool_result` error: "Your previous action triggered auth redirect and was NOT completed. Please retry."
+- LLM now knows: "My click was intercepted, not executed. I need to click the upvote again."
+- Clicks correct upvote element → vote registers → `done()` → verify `PASSED`
+
+---
+
+### Failure Modes — Updated
+
+| # | Failure Mode | Harness Response |
+|---|---|---|
+| LLM assumes auth-intercepted action succeeded | Fixed — `pendingToolError` set when auth wall is handled | LLM told "action not completed, retry" |
+| Verify FAILED → silent exit | Fixed — `pendingToolError` = failure reason, loop continues | LLM gets failure details and retries |
+
+---
+
+## Session 8 — 2026-06-11
+
+### What We Built
+Four fixes to SPA compatibility + Gemini as a third LLM provider:
+
+1. **`waitForLoadState` fix** — replaced bare `networkidle` (30s, always times out on SPAs) with `load` + `networkidle(5s)` with silent catch. Normal sites settle quickly; SPAs get 5s to render then harness moves on.
+2. **DOM-aware stuck loop** — replaced URL-only stuck detection with URL + DOM fingerprint check. LinkedIn messaging changes content without changing URL; the old 3-step URL check fired prematurely. New: 4-step window, both URL and first 200 chars of DOM must be identical to trigger.
+3. **Auth wall redirect fix** — after login, harness now navigates to the intended destination directly (extracted from auth wall URL query params) instead of navigating through the redirect chain. Eliminates the 30s `page.goto` crash on LinkedIn's `/authwall?...&sessionRedirect=...` URLs.
+4. **Gemini adapter** — third LLM provider. Set `LLM_PROVIDER=gemini` to switch.
+
+---
+
+### Files Created / Changed
+| File | Change |
+|---|---|
+| `src/tools.ts` | `waitForLoadState('networkidle')` → `load` + `networkidle(5s, catch)` in all 3 tools |
+| `src/runner.ts` | `isStuckLoop` now tracks `{url, dom}` pairs; window 3→4; `urlHistory` → `stateHistory` |
+| `src/loginHandler.ts` | `extractDestination()` helper — extracts `sessionRedirect` / `next` / `redirect_uri` from auth wall URLs; `page.goto()` wrapped in try/catch |
+| `src/llmAdapter.ts` | Added `GeminiAdapter` + updated `Provider` type and factory |
+| `package.json` | Added `@google/generative-ai` dependency |
+
+---
+
+### Architecture: Updated Provider List
+```
+LLM_PROVIDER=anthropic  →  AnthropicAdapter  (tool_use blocks, ID pairing)
+LLM_PROVIDER=ollama     →  OllamaAdapter     (OpenAI tool_calls format)
+LLM_PROVIDER=gemini     →  GeminiAdapter     (functionCall parts, name-based matching)
+```
+
+---
+
+### Concepts Learned
+
+#### `waitForLoadState` — the three modes
+- `networkidle` — zero background connections for 500ms. Never fires on SPAs (LinkedIn, Gmail, etc.). Wrong default for modern web apps.
+- `load` — HTML document + synchronous resources done. Fires in ~200ms but SPA JS hasn't rendered yet.
+- The right pattern: `waitForLoadState('load')` then `waitForLoadState('networkidle', { timeout: 5000 })` with silent catch. Normal sites settle in <1s; SPAs render within 5s even if background traffic never stops.
+
+#### Stuck loop — URL is not enough
+- A URL-only stuck loop works on traditional multi-page apps where every meaningful action changes the URL.
+- SPAs like LinkedIn messaging change DOM content without changing the URL (switching between conversation threads, loading profiles in sidebars, etc.).
+- Fix: fingerprint both URL and DOM. Only truly stuck if both are unchanged for N consecutive steps.
+
+#### Auth wall redirect chains
+- Auth wall URLs encode the intended destination as a query param (`sessionRedirect`, `next`, `redirect_uri`).
+- Navigating back to the auth wall URL forces the browser through a redirect chain, which can take >30s.
+- Fix: extract the destination param and navigate directly. Skips the chain, avoids the timeout.
+
+#### Gemini function calling — `mode: 'ANY'`
+- Gemini's default tool mode is `'AUTO'` — the model decides whether to call a tool or respond with text.
+- In an agentic loop, text-only responses are always wrong (no tool call = harness has nothing to execute).
+- Fix: `toolConfig: { functionCallingConfig: { mode: 'ANY' } }` — forces Gemini to always call one of the registered tools, same constraint Anthropic applies by default.
+
+#### Gemini vs Anthropic tool protocol differences
+| | Anthropic | Gemini |
+|---|---|---|
+| Tool call format | `tool_use` block with an ID | `functionCall` part (no ID) |
+| Tool result format | `tool_result` block matched by ID | `functionResponse` part matched by name |
+| Parallel tool use | Yes — track all IDs | No — single call per turn |
+| System prompt | Separate `system` field | `systemInstruction` in model config |
+| Role names | `user` / `assistant` | `user` / `model` |
+
+---
+
+### Bugs Hit & Fixed (Session 8)
+
+| Bug | Cause | Fix |
+|---|---|---|
+| Every LinkedIn action threw 30s timeout | `waitForLoadState('networkidle')` never fires on SPAs | `load` + `networkidle(5s, catch)` in all tools |
+| Stuck loop fired mid-task on LinkedIn messaging | URL unchanged when switching threads; window=3 too small | DOM fingerprint check + window=4 |
+| `page.goto` crashed on auth wall URL | LinkedIn's `/authwall?...` redirect chain takes >30s | `extractDestination()` navigates directly to `sessionRedirect` target |
+| Gemini returned plain text, no tool call | Default mode `'AUTO'` lets Gemini skip tool use | `toolConfig: { functionCallingConfig: { mode: 'ANY' } }` |
