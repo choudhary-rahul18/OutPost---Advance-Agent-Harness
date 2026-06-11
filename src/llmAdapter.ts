@@ -68,7 +68,7 @@ class AnthropicAdapter implements LLMAdapter {
 
     const response = await this.client.messages.create({
       model: process.env.ANTHROPIC_MODEL ?? 'claude-haiku-4-5-20251001',
-      max_tokens: 1024,
+      max_tokens: 4096,
       system: this.systemPrompt,
       messages: this.messages,
       tools: toolSchemas,

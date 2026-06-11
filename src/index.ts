@@ -19,24 +19,36 @@ const task = new HNUpvoteTask();
 // task.systemPrompt = `You are a browser automation agent.
 // Your task is to read and summarize the top story on Hacker News.
 // 1. Go to https://news.ycombinator.com.
-// 2. Open the first post which is related to Anthropic.
-// 3. Read it all and make a summary of it.
-// 3. Call done() when summary is done`;
-
-// task.systemPrompt = `You are a browser automation agent.
-// Your task is to read and collect information about a person.
-// 1. Go to https://www.linkedin.com/in/rahul18-iitb.
-// 2. Go to his Chat Section.
-// 3. Read the profile of first person, if he is a sponsore, skip him and move to Next Person.
-// 2. Read everything about the person.
-// 3. Call done() with a clear summary with key details of person.`;
+// 2. Open the third post which is related to Anthropic.
+// 3. Read it all and make a detailed summary of it.
+// 5. save your summary to a markdown file with any title you think is suitable.
+// 4. Call done() when all tasks are completed.`;
 
 task.systemPrompt = `You are a browser automation agent.
 Your task is to read and collect information about a person.
 1. Go to https://www.linkedin.com/in/rahul18-iitb.
-2. Go to his profile.
-3. Read everything about the person.
-4. Call done() with a clear detailed summary with key details of person.`;
+2. Go to his Chat Section.
+3. Read the profile of first person, if he is a sponsore, skip him and move to Next Person.
+2. Read everything about the person.
+3. Call done() with a clear summary with key details of person.`;
+
+task.systemPrompt = `You are a browser automation agent.
+Your task is to read and collect information about a person.
+1. Go to https://www.linkedin.com/in/rahul18-iitb.
+3. Search for Harish, maybe Harish Chand who is also Connected with him.
+4. Go to his profile.
+5. Read everything about the person.
+6. Call done() with a clear summary with key details of person.`;
+
+
+// task.systemPrompt = `You are a browser automation agent.
+// Your task is to read and collect information about a person.
+// 1. Go to https://www.linkedin.com/in/rahul18-iitb.
+// 2. Go to his profile.
+// 3. Read everything about the person.
+// 4. Create a detailed summary with key details of person.
+// 5. save your summary to a markdown file with any title you think is suitable.
+// 4. Call done() when all tasks are completed.`;
 
 
 await runTask(task, provider);

@@ -79,7 +79,18 @@ export async function runTask(task: Task, provider: Provider): Promise<void> {
 
       // ── Ask the LLM for the next action ───────────────────────────────────
       console.log(`[LLM] Asking ${provider} for next action...`);
-      const { toolName, toolInput, reasoning } = await adapter.getNextAction({ url, title, tree }, pendingToolError);
+      let toolName: string;
+      let toolInput: Record<string, unknown>;
+      let reasoning: string;
+      try {
+        ({ toolName, toolInput, reasoning } = await adapter.getNextAction({ url, title, tree }, pendingToolError));
+      } catch (err) {
+        const msg = (err as Error).message.split('\n')[0];
+        console.log(`[HARNESS] LLM API error: ${msg}`);
+        console.log('[HARNESS] Retrying next step...');
+        pendingToolError = undefined;
+        continue;
+      }
       pendingToolError = undefined;
 
       if (reasoning) console.log(`[LLM] Reasoning: ${reasoning}`);

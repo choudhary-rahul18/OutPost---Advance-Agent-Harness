@@ -5,7 +5,7 @@ import { LoginHandler, CookieLoginHandler } from '../src/loginHandler.js';
 export class HNUpvoteTask implements Task {
   name = 'HN Upvote';
   startUrl = 'https://news.ycombinator.com';
-  maxSteps = 10;
+  maxSteps = 20;
   loginHandler: LoginHandler = new CookieLoginHandler();
 
   systemPrompt = `You are a browser automation agent.

@@ -51,9 +51,16 @@ export async function extractDOM(page: Page): Promise<string> {
     }
 
     // Return a plain string — safe to cross the page.evaluate() bridge.
-    return lines.length > 0
+    const raw = lines.length > 0
       ? lines.join('\n')
       : '(no interactive elements found on this page)';
+
+    // Sanitise: strip unpaired Unicode surrogates.
+    // Sites like LinkedIn emit broken UTF-16 in DOM text. Lone surrogates are
+    // invalid in JSON — the Anthropic/Gemini API will reject the entire request
+    // with "no low surrogate in string" if these slip through.
+    return raw.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/g, '')
+              .replace(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '');
   });
 
   return tree;
