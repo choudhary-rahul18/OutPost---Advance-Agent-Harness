@@ -1,11 +1,14 @@
 import { Page } from 'playwright';
 import * as fs from 'fs';
-import * as readline from 'readline';
+import { Services } from '../core/services.js';
 
 // ── LoginHandler interface ────────────────────────────────────────────────────
+// Services gives the handler the event bus (for status messages) and the IO
+// channel (for the "press Enter when logged in" pause) — no direct console or
+// stdin access, so the same handler works under a future web UI.
 export interface LoginHandler {
   canHandle(url: string): boolean;
-  login(page: Page, returnUrl: string): Promise<boolean>;
+  login(page: Page, returnUrl: string, services: Services): Promise<boolean>;
 }
 
 // ── CookieLoginHandler ────────────────────────────────────────────────────────
@@ -26,7 +29,7 @@ export class CookieLoginHandler implements LoginHandler {
     return true; // handles any auth wall — domain derived at login time
   }
 
-  async login(page: Page, returnUrl: string): Promise<boolean> {
+  async login(page: Page, returnUrl: string, sv: Services): Promise<boolean> {
     const hostname   = new URL(page.url()).hostname;
     const cookiePath = `cookies/${hostname}.json`;
 
@@ -36,7 +39,7 @@ export class CookieLoginHandler implements LoginHandler {
 
     // ── Try saved cookies first ───────────────────────────────────────────
     if (fs.existsSync(cookiePath)) {
-      console.log(`[LOGIN] Found saved cookies for ${hostname}. Trying...`);
+      sv.bus.emit({ type: 'log', level: 'info', message: `[LOGIN] Found saved cookies for ${hostname}. Trying...` });
       const cookies = JSON.parse(fs.readFileSync(cookiePath, 'utf-8'));
       await page.context().addCookies(cookies);
       try {
@@ -46,25 +49,21 @@ export class CookieLoginHandler implements LoginHandler {
       }
       try { await page.waitForLoadState('networkidle', { timeout: 5000 }); } catch { /* SPA */ }
       if (!/\/login|\/signin|\/auth/.test(page.url())) {
-        console.log('[LOGIN] Session restored from saved cookies.');
+        sv.bus.emit({ type: 'log', level: 'info', message: '[LOGIN] Session restored from saved cookies.' });
         return true;
       }
-      console.log('[LOGIN] Saved cookies expired or invalid. Falling back to manual login.');
+      sv.bus.emit({ type: 'log', level: 'warn', message: '[LOGIN] Saved cookies expired or invalid. Falling back to manual login.' });
     }
 
     // ── Manual login fallback ─────────────────────────────────────────────
-    console.log(`\n[LOGIN] ── Manual login required for ${hostname} ──────────`);
-    console.log('[LOGIN] The browser is open. Please log in manually.');
-    console.log('[LOGIN] Press Enter here when you are done.');
-    console.log('[LOGIN] ────────────────────────────────────────────────────\n');
-
-    await waitForEnter();
+    sv.bus.emit({ type: 'log', level: 'info', message: `[LOGIN] Manual login required for ${hostname}. The browser is open — please log in.` });
+    await sv.io.ask('[LOGIN] Press Enter here when you are done... ');
 
     // Save cookies so the next run skips this step
     const cookies = await page.context().cookies();
     fs.mkdirSync('cookies', { recursive: true });
     fs.writeFileSync(cookiePath, JSON.stringify(cookies, null, 2));
-    console.log(`[LOGIN] Cookies saved to ${cookiePath}. Future runs will skip login.`);
+    sv.bus.emit({ type: 'log', level: 'info', message: `[LOGIN] Cookies saved to ${cookiePath}. Future runs will skip login.` });
 
     try {
       await page.goto(targetUrl);
@@ -95,11 +94,4 @@ function extractDestination(url: string): string {
   } catch {
     return url;
   }
-}
-
-function waitForEnter(): Promise<void> {
-  return new Promise(resolve => {
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    rl.question('', () => { rl.close(); resolve(); });
-  });
 }

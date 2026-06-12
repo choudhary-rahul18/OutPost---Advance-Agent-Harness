@@ -701,3 +701,64 @@ LLM_PROVIDER=gemini     →  GeminiAdapter     (functionCall parts, name-based m
 | Stuck loop fired mid-task on LinkedIn messaging | URL unchanged when switching threads; window=3 too small | DOM fingerprint check + window=4 |
 | `page.goto` crashed on auth wall URL | LinkedIn's `/authwall?...` redirect chain takes >30s | `extractDestination()` navigates directly to `sessionRedirect` target |
 | Gemini returned plain text, no tool call | Default mode `'AUTO'` lets Gemini skip tool use | `toolConfig: { functionCallingConfig: { mode: 'ANY' } }` |
+
+---
+
+## Session 10 — 2026-06-12
+
+### What We Built
+The full architecture redesign — OutPost is now a three-agent, event-driven harness instead of a single loop with a hard-coded prompt:
+
+1. **Clarifier agent** — interviews the user in the terminal (one question at a time, essentials only), then proposes a **CampaignSpec** (ordered list of TaskSpecs). The user approves, requests changes (which loop back into the same conversation), or cancels — all before any browser opens.
+2. **Orchestrator** — deterministic campaign loop. Opens ONE browser session for the whole campaign (logins persist across tasks), renders `{{outputKey}}` placeholders in later prompts from earlier task outputs (**CampaignContext**), runs each task through the generic runner.
+3. **Guard pipeline** — auth wall / stuck loop / error page checks are now pluggable `Guard[]` objects returning `pass | abort | skip_llm`. Adding a guard never touches the runner.
+4. **Event bus + run traces** — the runner emits typed `HarnessEvent`s; the terminal renders them and every run is recorded to `runs/<timestamp>/trace.jsonl`. A future web UI is just another listener + an `IOChannel` implementation.
+5. **Five new tools** — `read_page` (full visible text — the DOM tree only lists interactive elements), `go_back`, `press_key`, `hover`, and `ask_user` (mid-run questions to the user). Tool string returns now flow back to the LLM as tool_result content.
+6. **Hybrid verification** — Clarifier picks a library task (`hn_upvote` with its `:not(.nosee)` check) when one matches, else `GenericTask` (auth wall / error page / report-written checks).
+7. **History pruning** — adapters keep the last 4 observations full, collapse older DOM trees. Long campaigns no longer grow context linearly (Session 2's token-growth concern).
+
+### Files Created / Changed
+Complete restructure: `src/core/` (orchestrator, runner, guards, context, events, services), `src/agents/clarifier.ts`, `src/llm/` (adapter + one file per provider), `src/browser/` (session, domExtractor, loginHandler), `src/tools/` (registry, browserTools, harnessTools), `src/io/` (channel, terminal, trace), `src/spec.ts`, `tasks/{registry,generic}.ts`, `tasks/library/hn_upvote.ts`. Deleted: old `src/{runner,tools,llmAdapter,task,domExtractor,loginHandler}.ts`, `tasks/hn_upvote.ts`.
+
+### Key Design Principles Established
+- **Clarify before executing** — ambiguity is resolved with the user upfront (Clarifier) or mid-run (`ask_user`), never by guessing. No browser until the plan is approved.
+- **The Clarifier writes the executor's system prompt** — the spec is data (like a Python dataclass), validated in code before it becomes a Task.
+- **Tools as plugins** — a `ToolDefinition` bundles schema + executor in one object; the same `Toolset` mechanism serves the executor (browser tools) and the Clarifier (interview tools).
+- **LoginHandler talks through Services** — `bus` for status, `io.ask()` for the manual-login pause. No direct console/stdin, so it works under any future UI.
+
+### Test Runs
+- **Clarifier round-trip (piped input)** — goal "Upvote the top story on Hacker News": zero unnecessary questions, picked `hn_upvote` taskType, maxSteps 10, rendered the plan for approval. ✅
+- **Stdin-EOF hardening** — piped input running out now produces a clean "Input stream is closed" error instead of a readline stack trace. ✅
+- **Live end-to-end** — goal → clarify → approve → browser → click upvote → auth wall guard → cookie login → `skip_llm` message → LLM retried the correct element → done → verify. (Result recorded below.)
+
+**Live end-to-end result:** PASSED. Step 1 click → auth wall → guard logged in via saved cookies and told the LLM its click was intercepted → step 3 LLM re-clicked the correct upvote → step 4 `done()` → verifier confirmed `vote link is nosee for story 48497609` → campaign COMPLETED, browser closed, exit 0. Full event record in `runs/<timestamp>/trace.jsonl`. ✅
+
+### Post-session fix — stuck loop must escalate, not abort
+A LinkedIn messaging run died with `[GUARD:stuckLoop] ABORT` even though the page WAS changing (search cleared, conversations loaded). Two bugs, two fixes:
+
+| Bug | Fix |
+|---|---|
+| DOM fingerprint was only the first 200 chars of the tree — on LinkedIn messaging that's the nav bar, which never changes. Real changes (loaded conversations) were invisible to the guard → false positive. | Runner stores the **full DOM tree** in guard history; stuck = URL + entire tree identical for 4 steps. |
+| Genuinely stuck → instant `abort`. The agent never got told its approach was failing, and the user (sitting right there) was never asked. | **3-tier escalation** in `stuckLoopGuard`: ① warn the LLM ("your last 4 actions changed nothing — try a different approach / read_page / ask_user") → ② ask the USER for a hint (or "stop") and forward it to the LLM → ③ abort only if guidance also goes nowhere. Each tier clears the history window for a fresh 4 steps. New guard verdict `inform_llm`: message is attached to the previous tool_result but the LLM still acts this step (unlike `skip_llm`). |
+
+**Principle established: stuck ≠ dead.** Failure paths escalate — LLM first, user second, abort last.
+Verified with a scripted guard test: changed-DOM pass / tier-1 warn / tier-2 ask + guidance forwarded / tier-3 abort / "stop" aborts immediately. `tsc` clean.
+
+### Post-session fix 2 — popup/dialog blindness
+A LinkedIn run failed when clicking "Message" opened a compose popup the agent couldn't operate. Three root causes, all in harness code:
+
+| Bug | Fix |
+|---|---|
+| Extractor only queried `a, button, input, select, textarea`. LinkedIn popups are `<div>`s with ARIA roles — the "harish chand • 1st" suggestion (`role="option"`) and the message box (`contenteditable`) had no index, so the LLM could see them in text but never click them. | Selector broadened to ARIA roles (`button, link, option, menuitem, tab, checkbox, radio, combobox, switch, listbox`), `[contenteditable="true"]`, `[onclick]`. Descriptions now include `role="…"` and `(text input — editable)`. |
+| Nothing told the LLM a popup was open or which elements belonged to it. | Extractor detects visible `[role="dialog"] / [role="alertdialog"] / [aria-modal="true"]`, prints a `*** POPUP/DIALOG OPEN: "<label>" ***` banner at the top of the tree, and marks every element inside with `(IN POPUP)` — plus the hint that Escape closes most popups. |
+| Failed clicks took Playwright's default 30s timeout — steps 17–18 burned a full minute before the LLM could adapt. | `ACTION_TIMEOUT = 8000` on click/fill/hover. Click timeout errors now carry a hint: stale index or popup overlay → check for `(IN POPUP)` elements or `press_key "Escape"`. |
+
+Verified in a headless browser against a synthetic LinkedIn-style popup (banner + `(IN POPUP)` marks + editable detection all correct) and against real HN (230 elements, ~14K chars — no size blow-up). `tsc` clean.
+
+### Post-session fix 3 — the end-state is part of the plan (keepBrowserOpen + follow-up loop)
+A "play a song on YouTube" campaign verified PASSED and instantly closed the browser — killing the song, which WAS the deliverable. Fix in two layers:
+
+1. **`keepBrowserOpen` on CampaignSpec** — the Clarifier sets it true when the goal is to watch/listen/view something (rule in its system prompt + required field in the finalize_campaign schema). Shown in the plan preview: "(browser will stay open at the end until you close it)".
+2. **Follow-up loop in the orchestrator** — instead of a dead "press Enter to close", the prompt accepts new instructions. Typed text becomes a quick GenericTask (maxSteps 15) whose `startUrl` is the CURRENT page, run in the SAME browser session — "fullscreen", "play another song", etc., loop until Enter/"close". Supporting change in the runner: skip `page.goto(startUrl)` when already on that URL, so a follow-up doesn't reload the page and restart the video.
+
+Verified live by the user: YouTube campaign passed, browser stayed open with the song playing, prompt appeared. `tsc` clean.

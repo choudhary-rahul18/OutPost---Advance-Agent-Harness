@@ -1,7 +1,11 @@
 import { Page } from 'playwright';
-import { Task } from '../src/task.js';
-import { LoginHandler, CookieLoginHandler } from '../src/loginHandler.js';
+import { Task, TaskSpec } from '../../src/spec.js';
+import { LoginHandler, CookieLoginHandler } from '../../src/browser/loginHandler.js';
 
+// ── HNUpvoteTask — library task with platform-specific verification ──────────
+// Picked by the Clarifier (taskType: "hn_upvote") when the goal is upvoting a
+// Hacker News story. Its verify() checks the actual DOM signal HN uses —
+// something the GenericTask cannot do.
 export class HNUpvoteTask implements Task {
   name = 'HN Upvote';
   startUrl = 'https://news.ycombinator.com';
@@ -14,6 +18,16 @@ Go to https://news.ycombinator.com, find the top story, and click its upvote arr
 Make sure to complete the task.`;
 
   private votedStoryId: string | null = null;
+
+  // The Clarifier's spec overrides the defaults (which story, how many steps).
+  constructor(spec?: TaskSpec) {
+    if (spec) {
+      this.name = spec.name;
+      this.systemPrompt = spec.systemPrompt;
+      this.maxSteps = spec.maxSteps;
+      if (spec.startUrl) this.startUrl = spec.startUrl;
+    }
+  }
 
   isAuthWall(url: string): boolean {
     return /\/login|\/signin|\/auth|\/vote\?id=/.test(url);
