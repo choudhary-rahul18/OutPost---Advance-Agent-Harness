@@ -150,8 +150,11 @@ export const browserTools: ToolDefinition[] = [
       description: 'Extract the full visible text content of the current page. Use this to actually READ articles, profiles, or posts — the DOM tree only lists interactive elements, not the text between them.',
       input_schema: { type: 'object', properties: {}, required: [] },
     },
-    async execute({ page }) {
-      const MAX_CHARS = 8000;
+    async execute({ page, compact }) {
+      // Default: 8K chars (enough for most pages).
+      // Compact mode (activated after a context-overflow error): 40K chars —
+      // the DOM tree is already cut to 200 elements, so we can afford more text.
+      const MAX_CHARS = compact ? 40_000 : 8_000;
       const raw = await page.evaluate(() => document.body?.innerText ?? '');
       const text = sanitizeText(raw).trim();
       if (text.length === 0) return '(page has no visible text)';

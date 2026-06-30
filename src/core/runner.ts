@@ -41,11 +41,14 @@ export async function runTask(task: Task, page: Page, provider: Provider, sv: Se
   // The harness→LLM back-channel: tool output, tool error, guard interception,
   // or a verify failure — delivered as the previous action's tool_result.
   let pendingResult: ToolResultMsg | undefined;
+  // Activated after a "prompt too long" API error. Caps DOM to 200 elements
+  // and read_page to 40K chars for all remaining steps in this task.
+  let compactMode = false;
 
   for (let step = 0; step < task.maxSteps; step++) {
     const url   = page.url();
     const title = await page.title();
-    const tree  = await extractDOM(page);
+    const tree  = await extractDOM(page, compactMode);
 
     sv.bus.emit({ type: 'step_started', step: step + 1, maxSteps: task.maxSteps, url, title });
     // Full tree, not a truncated fingerprint — SPA changes can be anywhere.
@@ -95,7 +98,12 @@ export async function runTask(task: Task, page: Page, provider: Provider, sv: Se
       ({ toolName, toolInput, reasoning } = await adapter.getNextAction(observation, pendingResult));
     } catch (err) {
       const msg = (err as Error).message.split('\n')[0];
-      sv.bus.emit({ type: 'log', level: 'error', message: `LLM API error: ${msg}. Retrying next step...` });
+      if (/too long|prompt.*token|context.*length/i.test(msg) && !compactMode) {
+        compactMode = true;
+        sv.bus.emit({ type: 'log', level: 'warn', message: `Context overflow detected — switching to compact mode (DOM capped at 200 elements, read_page at 40K chars).` });
+      } else {
+        sv.bus.emit({ type: 'log', level: 'error', message: `LLM API error: ${msg}. Retrying next step...` });
+      }
       pendingResult = undefined;
       continue;
     }
@@ -135,7 +143,7 @@ export async function runTask(task: Task, page: Page, provider: Provider, sv: Se
     }
 
     try {
-      const output = await executorToolset.run(toolName, { page, services: sv }, toolInput);
+      const output = await executorToolset.run(toolName, { page, services: sv, compact: compactMode }, toolInput);
       await page.waitForTimeout(1000);
       if (typeof output === 'string') {
         // Tool produced output (read_page text, ask_user answer, ...) —

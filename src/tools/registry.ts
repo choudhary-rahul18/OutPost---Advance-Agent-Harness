@@ -11,6 +11,7 @@ import { Services } from '../core/services.js';
 export interface ToolContext {
   page: Page;
   services: Services;
+  compact: boolean;  // true when context overflow was detected — tools use tighter limits
 }
 
 export interface ToolDefinition {

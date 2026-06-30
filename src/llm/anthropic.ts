@@ -35,13 +35,22 @@ export class AnthropicAdapter implements LLMAdapter {
 
     this.pruneHistory();
 
-    const response = await this.client.messages.create({
-      model: process.env.ANTHROPIC_MODEL ?? 'claude-haiku-4-5-20251001',
-      max_tokens: 4096,
-      system: this.systemPrompt,
-      messages: this.messages,
-      tools: this.tools,
-    });
+    let response: Awaited<ReturnType<typeof this.client.messages.create>>;
+    try {
+      response = await this.client.messages.create({
+        model: process.env.ANTHROPIC_MODEL ?? 'claude-haiku-4-5-20251001',
+        max_tokens: 4096,
+        system: this.systemPrompt,
+        messages: this.messages,
+        tools: this.tools,
+      });
+    } catch (err) {
+      // Roll back the user message we just pushed so history stays consistent
+      // for the next call. pendingToolCallIds is unchanged — the previous
+      // assistant tool_use still needs to be closed on the next attempt.
+      this.messages.pop();
+      throw err;
+    }
 
     this.messages.push({ role: 'assistant', content: response.content });
 

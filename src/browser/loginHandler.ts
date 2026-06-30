@@ -89,7 +89,7 @@ function extractDestination(url: string): string {
       parsed.searchParams.get('redirect_uri')    ??
       parsed.searchParams.get('next')            ??
       parsed.searchParams.get('return_to')       ??
-      url
+      parsed.origin  // no redirect param — go to site home; the site will redirect to feed/dashboard
     );
   } catch {
     return url;

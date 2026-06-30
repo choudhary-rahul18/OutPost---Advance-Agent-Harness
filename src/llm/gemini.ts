@@ -9,6 +9,25 @@ import { LLMAdapter, ActionResult, ToolResultMsg, ToolSchema, KEEP_RECENT, prune
 //   • function response + next observation combined into one user message
 //     to preserve the required user/model alternation
 
+// Retry on transient errors (503 overload, 429 rate-limit) with exponential backoff.
+async function withRetry<T>(fn: () => Promise<T>, maxAttempts = 4): Promise<T> {
+  let delay = 2000;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const isTransient = /503|429|overload|rate.?limit|try again/i.test(msg);
+      if (!isTransient || attempt === maxAttempts) throw err;
+      console.error(`[LLM] Gemini error (attempt ${attempt}/${maxAttempts}): ${msg}`);
+      console.error(`[LLM] Retrying in ${delay / 1000}s…`);
+      await new Promise(r => setTimeout(r, delay));
+      delay *= 2;
+    }
+  }
+  throw new Error('unreachable');
+}
+
 // Translate Anthropic tool schemas → Gemini FunctionDeclaration format.
 // Gemini accepts standard JSON Schema for parameters, so input_schema passes through.
 function toGeminiTools(schemas: ToolSchema[]) {
@@ -63,7 +82,14 @@ export class GeminiAdapter implements LLMAdapter {
     this.history.push(userMessage);
     this.pruneHistory();
 
-    const result = await this.model.generateContent({ contents: this.history });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let result: any;
+    try {
+      result = await withRetry(() => this.model.generateContent({ contents: this.history }));
+    } catch (err) {
+      this.history.pop(); // rollback pushed user message so history stays valid
+      throw err;
+    }
     const modelContent: Content = result.response.candidates?.[0]?.content
       ?? { role: 'model', parts: [{ text: '' }] };
 

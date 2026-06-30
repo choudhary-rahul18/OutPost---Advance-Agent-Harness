@@ -793,3 +793,129 @@ The harness moved from a proof-of-concept single-loop executor to a **production
 - YouTube: search → play → keep browser open → follow-up instruction loop
 
 **Commit 54a2f55:** shipped to `main`. 32 files, +1771/−746 lines. `tsc --noEmit` clean. All tests verified in live browser.
+
+---
+
+## Session 11 — 2026-06-15
+
+### What We Tested
+Two real-world campaigns run against the full Session 10 architecture — both completed successfully.
+
+---
+
+### Test Runs
+
+#### Test 9 — Multi-step, multi-platform campaign (LinkedIn + Anthropic website)
+**Goal:** Find Harish Chand on LinkedIn (connected) → send "HI" → go to Anthropic website → read latest blog about Mythos → summarize → share summary back to Harish on LinkedIn.
+
+- Clarifier broke this into ordered TaskSpecs: LinkedIn search task → Anthropic read task → LinkedIn message task
+- LinkedIn search found Harish Chand (connected profile), sent "HI" via compose popup
+- Navigated to Anthropic website, used `read_page` to extract full blog content about Mythos, generated summary
+- Passed summary via `{{outputKey}}` CampaignContext into the third task's system prompt
+- Sent summary to Harish on LinkedIn in the same browser session (cookies persisted)
+- **Result:** End-to-end multi-platform campaign with context passing PASSED ✅
+
+#### Test 10 — Media campaign (YouTube)
+**Goal:** Search and play "One Thousand Miles" by Honey Singh on YouTube.
+
+- Clarifier set `keepBrowserOpen: true`
+- Agent searched YouTube, found the song, played it
+- Browser stayed open with song playing; follow-up loop activated
+- **Result:** PASSED, browser kept open ✅
+
+---
+
+### Failure Mode Observed
+
+| # | Failure Mode | What Happened | Fix Needed |
+|---|---|---|---|
+| 1 | **Google-native platform crash without prior login** | YouTube and Gmail (Google-owned sites) crash or hit auth walls mid-campaign when not logged in beforehand. The CookieLoginHandler pause works but the Google SSO flow is complex enough to cause instability. | For Google-native platforms, the Clarifier (or a pre-flight check) should detect the domain and prompt the user to log in manually before the campaign starts — same as the first-run cookie flow but triggered earlier. |
+
+---
+
+### Key Takeaway
+The Session 10 architecture held up under real multi-step, multi-platform campaigns. The one actionable gap: **Google-native platforms (YouTube, Gmail, Google Docs, etc.) need a pre-flight login prompt** rather than relying on mid-run auth wall interception.
+
+---
+
+## Session 12 — 2026-06-30
+
+### What We Built
+Six reliability fixes across LLM resilience, context management, auth recovery, and platform-specific routing.
+
+---
+
+### Fix 1 — Gemini LLM retry on transient errors (`src/llm/gemini.ts`)
+Gemini was crashing campaigns on 503 "high demand" and 429 rate-limit errors with no recovery. Added `withRetry()` — exponential backoff (2s → 4s → 8s), up to 4 attempts, matches on `503 | 429 | overload | rate-limit | try again`. Non-transient errors (400, auth failures) are not retried.
+
+---
+
+### Fix 2 — Context overflow: compact mode (`src/core/runner.ts`, `src/browser/domExtractor.ts`, `src/tools/browserTools.ts`, `src/tools/registry.ts`)
+
+**Root cause:** An HN thread with 800 comments has 4000+ interactive elements. Each DOM tree observation was ~200K+ chars. With 4 full history steps, the total hit Anthropic's 200K token limit.
+
+**Design:** Compact mode is **off by default** — no behavior change for normal pages. It activates automatically the first time a "prompt too long" API error is detected.
+
+**What compact mode does:**
+- DOM tree: capped at 200 elements (from unlimited). Saves ~95% of context on heavy pages.
+- `read_page`: cap raised from 8K → 40K chars. With the DOM now small, we can afford more text content for the tasks that actually need it (summarization, reading articles).
+
+**Implementation:** `compactMode: boolean` flag in the runner. Passed as `compact` to `extractDOM(page, compact)` and `ToolContext`. Runner logs `[WARN] Context overflow detected — switching to compact mode` on activation. Stays on for the rest of that task.
+
+---
+
+### Fix 3 — Adapter history rollback on API error (`src/llm/anthropic.ts`, `src/llm/gemini.ts`)
+
+**Root cause:** When the API call threw (e.g. "prompt too long"), the adapter had already pushed the user message (with `tool_result` IDs) to history, but never pushed the assistant response. On the next step, the adapter tried to close the same `tool_use` IDs again — producing a dangling `tool_result` with no matching `tool_use` in the previous message → permanent 400 loop.
+
+**Fix:** Both adapters now wrap the API call in try/catch. On failure, `this.messages.pop()` (Anthropic) / `this.history.pop()` (Gemini) rolls back the user message. `pendingToolCallIds` / `pendingFunctionName` are unchanged, so the next step correctly closes the prior tool use. History is always in a valid state.
+
+---
+
+### Fix 4 — Post-login navigation to wrong URL (`src/browser/loginHandler.ts`)
+
+**Root cause:** `extractDestination(authWallUrl)` falls back to returning the auth wall URL itself when no redirect param is found (e.g. LinkedIn's `/login?trk=...` has no `sessionRedirect`). After login, `page.goto('/login?trk=...')` navigated back to the login page.
+
+**Fix:** Fallback changed from `url` → `parsed.origin` (e.g. `https://www.linkedin.com`). After login, the harness navigates to the site root, which redirects to the feed/dashboard once the session is active.
+
+---
+
+### Fix 5 — `loginAttempted` guard silently passed to confused LLM (`src/core/guards.ts`)
+
+**Root cause:** When `loginAttempted` was already `true` and the agent was still on an auth wall, the guard returned `pass` — the LLM saw a login page, had no credentials, and returned an empty tool call → task failed.
+
+**Fix:** Guard now returns `inform_llm` with an explicit message: "login is already handled — use `navigate` to go to your destination directly." The LLM recovers by navigating instead of trying to log in.
+
+---
+
+### Fix 6 — LinkedIn platform rule: no Messaging tab (`src/agents/clarifier.ts`)
+
+Added a "Platform-specific rules" section to the Clarifier's system prompt. For LinkedIn:
+> Never navigate to `linkedin.com/messaging`. To interact with someone, search their name in the LinkedIn search bar, open their profile, and act from there (e.g. click "Message" on the profile page).
+
+The Clarifier embeds this verbatim in every LinkedIn task's `systemPrompt`. The executor always goes profile → message, never Messaging section → search.
+
+---
+
+### Test Run — Session 12
+**Goal:** Find Anthropic Mythos post on HN → summarize → send to Hardik Gupta on LinkedIn → play "One Thousand Miles" on YouTube.
+
+- Task 1: Compact mode activated after context overflow on the 800-comment HN thread → DOM capped to 200 elements → successfully summarized, report saved to `Report/anthropic_mythos_hn_summary.md`. PASSED ✅
+- Task 2: LinkedIn cookies expired → manual login → post-login navigation fix landed on feed correctly → agent searched Hardik Gupta's profile → sent message. PASSED ✅
+- Task 3: YouTube song played, browser kept open. PASSED ✅
+
+---
+
+## Upcoming — Session 13
+
+### Two Planned Changes (carried over from Session 12 plan)
+
+#### 1. Remove `maxSteps` cap — replace with semantic guards
+- Remove the hard ceiling from `TaskSpec` and the runner.
+- Add step warning at ~20 steps via `ask_user`: "This is taking longer than expected — continue?"
+- Stuck loop guard is the real safety net.
+
+#### 2. JARVIS mode — always-on persistent loop
+- Process stays alive after campaign completes: "Ready. What's next?"
+- Only exits on `"quit"` / `"exit"`.
+- Fresh `BrowserContext` per campaign; cookie files reused from disk.

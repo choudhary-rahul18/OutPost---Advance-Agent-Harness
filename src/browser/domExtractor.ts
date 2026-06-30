@@ -5,7 +5,7 @@ import { Page } from 'playwright';
 //   Node.js (harness) → serialise → [browser V8] → execute → serialise → Node.js
 // The function has full access to document/window but CANNOT touch Node.js or Playwright.
 // The return value must be JSON-serialisable — a plain string here.
-export async function extractDOM(page: Page): Promise<string> {
+export async function extractDOM(page: Page, compact = false): Promise<string> {
   const tree = await page.evaluate(() => {
     // ── Everything inside this arrow function runs inside the browser ─────────
 
@@ -104,7 +104,16 @@ export async function extractDOM(page: Page): Promise<string> {
               .replace(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '');
   });
 
-  return tree;
+  if (!compact) return tree;
+
+  // Compact mode: cap at 200 elements to stay within token budget.
+  // Applied in Node.js after the browser returns the full tree.
+  const elementLines = tree.split('\n');
+  const MAX_ELEMENTS = 200;
+  if (elementLines.length <= MAX_ELEMENTS) return tree;
+  const truncated = elementLines.slice(0, MAX_ELEMENTS);
+  truncated.push(`…[${elementLines.length - MAX_ELEMENTS} more elements not shown — scroll or use read_page to access more content]`);
+  return truncated.join('\n');
 }
 
 // Same surrogate sanitisation for text extracted in Node (e.g. read_page output).

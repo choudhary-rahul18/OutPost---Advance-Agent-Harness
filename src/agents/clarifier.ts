@@ -30,7 +30,11 @@ Rules for the plan:
 - If the executor must read content, instruct it to use read_page. If the user wants findings saved, instruct write_report and set expectsReport to true.
 - taskType: use "hn_upvote" ONLY for upvoting a Hacker News story; otherwise "generic".
 - maxSteps: 10 for trivial tasks, 20 for typical tasks, 30 for long multi-page tasks.
-- keepBrowserOpen: true when the user's goal is to watch, listen to, or look at something in the browser (play a song or video, open/show a page) — the browser then stays open after completion until the user closes it. false for action or data tasks (upvote, send a message, collect info, save a report).`;
+- keepBrowserOpen: true when the user's goal is to watch, listen to, or look at something in the browser (play a song or video, open/show a page) — the browser then stays open after completion until the user closes it. false for action or data tasks (upvote, send a message, collect info, save a report).
+
+Platform-specific rules — you MUST include these verbatim in the systemPrompt of any task that uses that platform:
+
+LINKEDIN: Never navigate to the LinkedIn Messaging section (linkedin.com/messaging). To interact with someone (send a message, view a profile, connect), always search for the person by name using the LinkedIn search bar, open their profile, and act from there (e.g. click "Message" on their profile page).`;
 
 const clarifierTools: ToolSchema[] = [
   {

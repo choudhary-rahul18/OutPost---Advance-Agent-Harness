@@ -45,7 +45,13 @@ export const authWallGuard: Guard = {
 
     if (state.loginAttempted || !task.loginHandler?.canHandle(url)) {
       sv.bus.emit({ type: 'log', level: 'warn', message: 'Auth wall detected — no handler available or login already attempted.' });
-      return { action: 'pass' };
+      return {
+        action: 'inform_llm',
+        messageToLLM:
+          `You are on a login/auth page (${url}) but login has already been handled. ` +
+          `Do NOT try to log in manually — you have no credentials. ` +
+          `Instead, navigate directly to your destination using the navigate tool.`,
+      };
     }
 
     state.loginAttempted = true;
